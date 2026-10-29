@@ -88,19 +88,16 @@ contract Box is EIP712 {
     /// @param toTreasury the buffer, to the Treasury now
     /// @param escrow held here until the order is settled (a chain's later steps); may be zero
     /// @param ref attribution only; not used by the contract
-    function pay(
-        bytes32 orderId,
-        bytes32 commitment,
-        uint256 toFloat,
-        uint256 toTreasury,
-        uint256 escrow,
-        bytes32 ref
-    ) external returns (bytes32 key) {
+    function pay(bytes32 orderId, bytes32 commitment, uint256 toFloat, uint256 toTreasury, uint256 escrow, bytes32 ref)
+        external
+        returns (bytes32 key)
+    {
         if (toFloat + toTreasury + escrow == 0) revert NothingPaid();
         if (escrow > type(uint128).max) revert EscrowTooLarge();
         key = keyOf(msg.sender, orderId);
         if (orders[key].payer != address(0)) revert OrderExists();
-        orders[key] = Order({payer: msg.sender, paidAt: uint64(block.timestamp), closed: escrow == 0, escrow: uint128(escrow)});
+        orders[key] =
+            Order({payer: msg.sender, paidAt: uint64(block.timestamp), closed: escrow == 0, escrow: uint128(escrow)});
 
         if (toFloat != 0) IMDUSD.safeTransferFrom(msg.sender, FLOAT, toFloat);
         if (toTreasury != 0) IMDUSD.safeTransferFrom(msg.sender, TREASURY, toTreasury);
@@ -115,9 +112,8 @@ contract Box is EIP712 {
         if (o.payer == address(0)) revert UnknownOrder();
         if (o.closed) revert OrderClosed();
         if (s.toTreasury + s.toFloat + s.toPayer != o.escrow) revert WrongTotal();
-        bytes32 digest = _hashTypedDataV4(
-            keccak256(abi.encode(SETTLEMENT_TYPEHASH, s.key, s.toTreasury, s.toFloat, s.toPayer))
-        );
+        bytes32 digest =
+            _hashTypedDataV4(keccak256(abi.encode(SETTLEMENT_TYPEHASH, s.key, s.toTreasury, s.toFloat, s.toPayer)));
         (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, signature);
         if (err != ECDSA.RecoverError.NoError || recovered != SIGNER) revert BadSignature();
 
@@ -129,10 +125,13 @@ contract Box is EIP712 {
         emit Settled(s.key, s.toTreasury, s.toFloat, s.toPayer);
     }
 
-    /// @notice Execute many settlements in one transaction (the keeper's weekly run). Reverts if any fails.
+    /// @notice Execute many settlements in one transaction (the keeper's weekly run). An entry whose order is already
+    /// closed (reclaimed, settled ahead of the batch, or repeated in it) is skipped; reverts if any other entry fails.
     function settleMany(Settlement[] calldata s, bytes[] calldata signatures) external {
         if (s.length != signatures.length) revert WrongTotal();
         for (uint256 i; i < s.length; ++i) {
+            Order storage o = orders[s[i].key];
+            if (o.payer != address(0) && o.closed) continue;
             settle(s[i], signatures[i]);
         }
     }
