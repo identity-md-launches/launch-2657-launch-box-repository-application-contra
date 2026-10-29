@@ -2,9 +2,13 @@
 pragma solidity 0.8.30;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {Box} from "../src/Box.sol";
+import {BoxSigning} from "./helpers/BoxSigning.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 contract MockUsd is ERC20("imdUSD", "imdUSD") {
     function mint(address to, uint256 a) external {
@@ -42,8 +46,7 @@ contract BoxTest is Test {
     }
 
     function _sign(Box.Settlement memory s, uint256 key) internal view returns (bytes memory) {
-        bytes32 h = keccak256(abi.encode(box.SETTLEMENT_TYPEHASH(), s.key, s.toTreasury, s.toFloat, s.toPayer));
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", box.domainSeparator(), h));
+        bytes32 digest = BoxSigning.digest(address(box), block.chainid, s);
         (uint8 v, bytes32 r, bytes32 ss) = vm.sign(key, digest);
         return abi.encodePacked(r, ss, v);
     }
@@ -119,8 +122,9 @@ contract BoxTest is Test {
         uint256 ab = usd.balanceOf(alice);
         uint256 fb = usd.balanceOf(float_);
         uint256 tb = usd.balanceOf(treasury);
+        bytes memory sig = _sign(s, signerKey);
         vm.prank(mallory); // anyone may execute
-        box.settle(s, _sign(s, signerKey));
+        box.settle(s, sig);
         assertEq(usd.balanceOf(alice) - ab, 1e18);
         assertEq(usd.balanceOf(float_) - fb, 1.5e18);
         assertEq(usd.balanceOf(treasury) - tb, 0.5e18);
@@ -200,11 +204,12 @@ contract BoxTest is Test {
 
     function test_reclaimAfter60Days() public {
         _pay(alice, 1e18, 0, 3e18);
-        vm.warp(block.timestamp + 60 days - 1);
+        uint256 paidAt = vm.getBlockTimestamp();
+        vm.warp(paidAt + 60 days - 1);
         vm.prank(alice);
         vm.expectRevert(Box.TooEarly.selector);
         box.reclaim(ORDER);
-        vm.warp(block.timestamp + 1);
+        vm.warp(paidAt + 60 days);
         uint256 ab = usd.balanceOf(alice);
         vm.prank(alice);
         box.reclaim(ORDER);
@@ -481,6 +486,480 @@ contract BoxTest is Test {
         box.settle(s, _sign(s, signerKey));
         assertEq(usd.balanceOf(address(box)), 5e18);
     }
+
+    // Independent audit checks below also run unchanged in BoxForkTest.
+
+    struct PaidData {
+        bytes32 commitment;
+        uint256 toFloat;
+        uint256 toTreasury;
+        uint256 escrow;
+        bytes32 ref;
+    }
+
+    /// Snapshot all accounts affected by these tests, including spent allowances and order metadata.
+    function _auditState(bytes32[] memory keys) internal view returns (bytes32 state) {
+        state = keccak256(
+            abi.encode(
+                usd.balanceOf(alice),
+                usd.balanceOf(mallory),
+                usd.balanceOf(treasury),
+                usd.balanceOf(float_),
+                usd.balanceOf(address(box)),
+                usd.allowance(alice, address(box)),
+                usd.allowance(mallory, address(box))
+            )
+        );
+        for (uint256 i; i < keys.length; ++i) {
+            (address p, uint64 at, bool closed, uint128 escrow) = box.orders(keys[i]);
+            state = keccak256(abi.encode(state, keys[i], p, at, closed, escrow));
+        }
+    }
+
+    function _oneKey(bytes32 key) internal pure returns (bytes32[] memory keys) {
+        keys = new bytes32[](1);
+        keys[0] = key;
+    }
+
+    function _assertOrder(bytes32 key, address payer, uint64 paidAt, bool closed, uint128 escrow) internal view {
+        (address actualPayer, uint64 actualAt, bool actualClosed, uint128 actualEscrow) = box.orders(key);
+        assertEq(actualPayer, payer, "payer changed");
+        assertEq(actualAt, paidAt, "paidAt changed");
+        assertEq(actualClosed, closed, "incorrect order lifecycle");
+        assertEq(actualEscrow, escrow, "escrow truncated or changed");
+    }
+
+    function test_domainMatchesOperatorEncodingAndRefreshesOnChainChange() public {
+        assertEq(
+            box.SETTLEMENT_TYPEHASH(),
+            keccak256("Settlement(bytes32 key,uint256 toTreasury,uint256 toFloat,uint256 toPayer)")
+        );
+        uint256 oldChain = block.chainid; // Intentionally retain the original chain id across the mutations below.
+        bytes32 oldDomain = BoxSigning.domain(address(box), oldChain);
+        assertEq(box.domainSeparator(), oldDomain);
+        vm.chainId(oldChain + 1);
+        assertEq(box.domainSeparator(), BoxSigning.domain(address(box), oldChain + 1));
+        assertNotEq(box.domainSeparator(), oldDomain);
+        vm.chainId(oldChain);
+        assertEq(box.domainSeparator(), oldDomain);
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_PaidCanBeMatchedAgainstEveryQuoteField(
+        bytes32 orderId,
+        bytes32 commitment,
+        bytes32 ref,
+        uint96 f,
+        uint96 t,
+        uint96 e
+    ) public {
+        f = uint96(bound(f, 0, 100e18));
+        t = uint96(bound(t, 0, 100e18));
+        e = uint96(bound(e, 1, 100e18));
+        bytes32 expectedKey = keccak256(abi.encode(alice, orderId));
+        vm.recordLogs();
+        vm.prank(alice);
+        assertEq(box.pay(orderId, commitment, f, t, e, ref), expectedKey);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 paidCount;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(box)) continue;
+            ++paidCount;
+            assertEq(logs[i].topics.length, 4);
+            assertEq(
+                logs[i].topics[0], keccak256("Paid(bytes32,address,bytes32,bytes32,uint256,uint256,uint256,bytes32)")
+            );
+            assertEq(logs[i].topics[1], expectedKey);
+            assertEq(logs[i].topics[2], bytes32(uint256(uint160(alice))));
+            assertEq(logs[i].topics[3], orderId);
+            PaidData memory data = abi.decode(logs[i].data, (PaidData));
+            assertEq(data.commitment, commitment);
+            assertEq(data.toFloat, f);
+            assertEq(data.toTreasury, t);
+            assertEq(data.escrow, e);
+            assertEq(data.ref, ref);
+        }
+        assertEq(paidCount, 1, "operator must see exactly one complete Paid");
+        _assertOrder(expectedKey, alice, uint64(block.timestamp), false, e);
+    }
+
+    function test_zeroOrderIdAndOneWeiEscrowRoundTrip() public {
+        uint256 beforeBalance = usd.balanceOf(alice);
+        vm.prank(alice);
+        bytes32 key = box.pay(bytes32(0), bytes32(0), 0, 0, 1, bytes32(0));
+        assertEq(key, keccak256(abi.encode(alice, bytes32(0))));
+        Box.Settlement memory s = Box.Settlement(key, 0, 0, 1);
+        bytes memory sig = _sign(s, signerKey);
+        vm.expectEmit(true, false, false, true, address(box));
+        emit Box.Settled(key, 0, 0, 1);
+        vm.prank(mallory);
+        box.settle(s, sig);
+        assertEq(usd.balanceOf(alice), beforeBalance);
+        assertEq(usd.balanceOf(address(box)), 0);
+    }
+
+    function test_zeroPaymentLegsDoNotCallToken() public {
+        vm.mockCallRevert(address(usd), abi.encodeCall(IERC20.transferFrom, (alice, float_, 0)), bytes("zero float"));
+        vm.mockCallRevert(
+            address(usd), abi.encodeCall(IERC20.transferFrom, (alice, treasury, 0)), bytes("zero treasury")
+        );
+        vm.mockCallRevert(
+            address(usd), abi.encodeCall(IERC20.transferFrom, (alice, address(box), 0)), bytes("zero escrow")
+        );
+        for (uint256 i; i < 3; ++i) {
+            vm.prank(alice);
+            bytes32 key = box.pay(bytes32(i), 0, i == 0 ? 1 : 0, i == 1 ? 1 : 0, i == 2 ? 1 : 0, 0);
+            _assertOrder(key, alice, uint64(block.timestamp), i != 2, i == 2 ? 1 : 0);
+        }
+        vm.clearMockedCalls();
+        assertEq(usd.balanceOf(address(box)), 1);
+    }
+
+    function test_payTotalOverflowCannotCreateAnOrder() public {
+        bytes32[] memory keys = _oneKey(box.keyOf(alice, ORDER));
+        bytes32 beforeState = _auditState(keys);
+        vm.expectRevert(abi.encodeWithSignature("Panic(uint256)", 0x11));
+        _pay(alice, type(uint256).max, 1, 0);
+        assertEq(_auditState(keys), beforeState);
+        vm.expectRevert(abi.encodeWithSignature("Panic(uint256)", 0x11));
+        _pay(alice, type(uint256).max - 1, 1, 1);
+        assertEq(_auditState(keys), beforeState);
+        vm.expectRevert(Box.EscrowTooLarge.selector);
+        _pay(alice, 0, 0, type(uint256).max);
+        assertEq(_auditState(keys), beforeState);
+    }
+
+    function test_paymentFailuresAtEachLegRollBackBalancesAllowanceAndOrder() public {
+        // Fail at FLOAT, then TREASURY, then escrow, after earlier legs have actually transferred.
+        uint256[3] memory limits = [uint256(0), 11, 24];
+        for (uint256 mode; mode < 2; ++mode) {
+            for (uint256 leg; leg < 3; ++leg) {
+                uint256 snapshot = vm.snapshotState();
+                if (mode == 0) {
+                    vm.prank(alice);
+                    usd.approve(address(box), limits[leg]);
+                } else {
+                    deal(address(usd), alice, limits[leg]);
+                }
+                bytes32[] memory keys = _oneKey(box.keyOf(alice, ORDER));
+                bytes32 beforeState = _auditState(keys);
+                // The live token and the mock use different insufficient-balance/allowance errors.
+                vm.expectRevert();
+                _pay(alice, 11, 13, 17);
+                assertEq(_auditState(keys), beforeState, "failed pay was not atomic");
+                _assertOrder(keys[0], address(0), 0, false, 0);
+                deal(address(usd), alice, 41);
+                vm.prank(alice);
+                usd.approve(address(box), 41);
+                _pay(alice, 11, 13, 17); // the failed attempt did not consume the id
+                assertEq(usd.allowance(alice, address(box)), 0);
+                assertEq(usd.balanceOf(alice), 0);
+                assertEq(usd.balanceOf(address(box)), 17);
+                assertTrue(vm.revertToStateAndDelete(snapshot));
+            }
+        }
+    }
+
+    function test_falseReturnAtEachPaymentLegIsAtomicAndRetryable() public {
+        address[3] memory recipients = [float_, treasury, address(box)];
+        uint256[3] memory amounts = [uint256(11), 13, 17];
+        for (uint256 leg; leg < 3; ++leg) {
+            uint256 snapshot = vm.snapshotState();
+            bytes32[] memory keys = _oneKey(box.keyOf(alice, ORDER));
+            bytes32 beforeState = _auditState(keys);
+            vm.mockCall(
+                address(usd),
+                abi.encodeCall(IERC20.transferFrom, (alice, recipients[leg], amounts[leg])),
+                abi.encode(false)
+            );
+            vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(usd)));
+            _pay(alice, 11, 13, 17);
+            assertEq(_auditState(keys), beforeState);
+            vm.clearMockedCalls();
+            _pay(alice, 11, 13, 17);
+            assertEq(usd.balanceOf(address(box)), 17);
+            assertTrue(vm.revertToStateAndDelete(snapshot));
+        }
+    }
+
+    function test_settlementTransferFailuresAreAtomicAndRetryable() public {
+        bytes32 key = _pay(alice, 0, 0, 41);
+        bytes32 other = _payOther(53);
+        bytes32[] memory keys = new bytes32[](2);
+        keys[0] = key;
+        keys[1] = other;
+        Box.Settlement memory s = Box.Settlement(key, 11, 13, 17);
+        bytes memory sig = _sign(s, signerKey);
+        address[3] memory recipients = [treasury, float_, alice];
+        uint256[3] memory amounts = [uint256(11), 13, 17];
+        for (uint256 mode; mode < 2; ++mode) {
+            for (uint256 leg; leg < 3; ++leg) {
+                bytes32 beforeState = _auditState(keys);
+                bytes memory callData = abi.encodeCall(IERC20.transfer, (recipients[leg], amounts[leg]));
+                bytes memory reason = abi.encodeWithSignature("TokenTransferRejected()");
+                if (mode == 0) {
+                    vm.mockCall(address(usd), callData, abi.encode(false));
+                    reason = abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(usd));
+                } else {
+                    vm.mockCallRevert(address(usd), callData, reason);
+                }
+                vm.expectRevert(reason);
+                box.settle(s, sig);
+                assertEq(_auditState(keys), beforeState, "failed settlement consumed escrow or closed order");
+                vm.clearMockedCalls();
+            }
+        }
+        box.settle(s, sig);
+        assertEq(usd.balanceOf(address(box)), 53, "another order's escrow was touched");
+        (,, bool closed,) = box.orders(other);
+        assertFalse(closed);
+    }
+
+    function test_reclaimTransferFailureDoesNotConsumeClaim() public {
+        bytes32 key = _pay(alice, 0, 0, 17);
+        vm.warp(block.timestamp + 60 days);
+        bytes32[] memory keys = _oneKey(key);
+        bytes32 beforeState = _auditState(keys);
+        vm.mockCall(address(usd), abi.encodeCall(IERC20.transfer, (alice, 17)), abi.encode(false));
+        vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(usd)));
+        vm.prank(alice);
+        box.reclaim(ORDER);
+        assertEq(_auditState(keys), beforeState);
+        vm.clearMockedCalls();
+        uint256 beforeBalance = usd.balanceOf(alice);
+        vm.expectEmit(true, true, false, true, address(box));
+        emit Box.Reclaimed(key, alice, 17);
+        vm.prank(alice);
+        box.reclaim(ORDER);
+        assertEq(usd.balanceOf(alice), beforeBalance + 17);
+        assertEq(usd.balanceOf(address(box)), 0);
+    }
+
+    /// forge-config: default.fuzz.runs = 256
+    function testFuzz_badBatchEntryRollsBackEveryEarlierEntry(uint8 position, uint8 failure) public {
+        uint256 index = bound(position, 0, 3);
+        uint256 kind = bound(failure, 0, 3);
+        Box.Settlement[] memory batch = new Box.Settlement[](4);
+        bytes[] memory sigs = new bytes[](4);
+        bytes32[] memory keys = new bytes32[](4);
+        for (uint256 i; i < 4; ++i) {
+            vm.prank(i % 2 == 0 ? alice : mallory);
+            keys[i] = box.pay(bytes32(i), BODY, 0, 0, 5e18, 0);
+            batch[i] = Box.Settlement(keys[i], 1e18, 2e18, 2e18);
+            sigs[i] = _sign(batch[i], signerKey);
+        }
+        bytes32 beforeState = _auditState(keys);
+        bytes memory expected;
+        if (kind == 0) {
+            batch[index].key = keccak256("never paid");
+            expected = abi.encodeWithSelector(Box.UnknownOrder.selector);
+        } else if (kind == 1) {
+            batch[index].toPayer += 1;
+            expected = abi.encodeWithSelector(Box.WrongTotal.selector);
+        } else if (kind == 2) {
+            sigs[index] = _sign(batch[index], 0xBAD);
+            expected = abi.encodeWithSelector(Box.BadSignature.selector);
+        } else {
+            batch[index].toTreasury = type(uint256).max;
+            expected = abi.encodeWithSignature("Panic(uint256)", 0x11);
+        }
+        vm.expectRevert(expected);
+        box.settleMany(batch, sigs);
+        assertEq(_auditState(keys), beforeState, "batch left partial effects");
+        batch[index] = Box.Settlement(keys[index], 1e18, 2e18, 2e18);
+        sigs[index] = _sign(batch[index], signerKey);
+        box.settleMany(batch, sigs);
+        assertEq(usd.balanceOf(address(box)), 0);
+        for (uint256 i; i < 4; ++i) {
+            (,, bool closed,) = box.orders(keys[i]);
+            assertTrue(closed);
+        }
+    }
+
+    function test_emptyBatchAndClosedEntriesAreHarmless() public {
+        bytes32 key = _pay(alice, 1, 0, 0);
+        bytes32[] memory keys = _oneKey(key);
+        bytes32 beforeState = _auditState(keys);
+        vm.recordLogs();
+        box.settleMany(new Box.Settlement[](0), new bytes[](0));
+        Box.Settlement[] memory batch = new Box.Settlement[](3);
+        bytes[] memory sigs = new bytes[](3);
+        for (uint256 i; i < 3; ++i) {
+            batch[i] = Box.Settlement(key, type(uint256).max, 1, 1);
+            sigs[i] = hex"abcd";
+        }
+        box.settleMany(batch, sigs);
+        assertEq(vm.getRecordedLogs().length, 0, "skips must not report new settlements");
+        assertEq(_auditState(keys), beforeState);
+        vm.expectRevert(Box.OrderClosed.selector);
+        box.settle(batch[0], sigs[0]);
+        vm.expectRevert(Box.WrongTotal.selector);
+        box.settleMany(new Box.Settlement[](0), new bytes[](1));
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_compromisedSignerCanOnlySplitOneEscrow(uint128 amount, uint128 a, uint128 b) public {
+        uint256 escrow = bound(amount, 1, type(uint128).max);
+        deal(address(usd), alice, escrow);
+        bytes32 key = _pay(alice, 0, 0, escrow);
+        bytes32 other = _payOther(31);
+        uint256 t = bound(a, 0, escrow);
+        uint256 f = bound(b, 0, escrow - t);
+        Box.Settlement memory s = Box.Settlement(key, t, f, escrow - t - f);
+        bytes memory sig = _sign(s, signerKey);
+        uint256 treasuryBefore = usd.balanceOf(treasury);
+        uint256 floatBefore = usd.balanceOf(float_);
+        uint256 executorBefore = usd.balanceOf(mallory);
+        vm.prank(mallory);
+        box.settle(s, sig);
+        assertEq(usd.balanceOf(treasury) - treasuryBefore, t);
+        assertEq(usd.balanceOf(float_) - floatBefore, f);
+        assertEq(usd.balanceOf(alice), s.toPayer);
+        assertEq(usd.balanceOf(mallory), executorBefore, "executor gained someone else's escrow");
+        assertEq(usd.balanceOf(address(box)), 31);
+        _assertOrder(other, mallory, uint64(block.timestamp), false, 31);
+        _assertOrder(key, alice, uint64(block.timestamp), true, uint128(escrow));
+    }
+
+    function test_signerCannotConsumeOtherEscrowEvenWhenBoxHasEnoughBalance() public {
+        bytes32 key = _pay(alice, 0, 0, 1);
+        _payOther(100);
+        Box.Settlement memory s = Box.Settlement(key, 0, 101, 0);
+        bytes memory sig = _sign(s, signerKey);
+        bytes32[] memory keys = _oneKey(key);
+        bytes32 beforeState = _auditState(keys);
+        vm.expectRevert(Box.WrongTotal.selector);
+        box.settle(s, sig);
+        assertEq(_auditState(keys), beforeState);
+    }
+
+    /// forge-config: default.fuzz.runs = 256
+    function testFuzz_malformedSignatureLengthsDoNotConsumeEscrow(uint8 seed) public {
+        uint256 length = bound(seed, 0, 128);
+        if (length >= 65) ++length; // every length except the only supported length, 65
+        bytes32 key = _pay(alice, 0, 0, 17);
+        Box.Settlement memory s = Box.Settlement(key, 0, 0, 17);
+        bytes32[] memory keys = _oneKey(key);
+        bytes32 beforeState = _auditState(keys);
+        vm.expectRevert(Box.BadSignature.selector);
+        box.settle(s, new bytes(length));
+        assertEq(_auditState(keys), beforeState);
+        box.settle(s, _sign(s, signerKey));
+        assertEq(usd.balanceOf(address(box)), 0);
+    }
+
+    function test_zeroRecoveryAndPersonalSignAreRejected() public {
+        bytes32 key = _pay(alice, 0, 0, 17);
+        Box.Settlement memory s = Box.Settlement(key, 0, 0, 17);
+        vm.expectRevert(Box.BadSignature.selector);
+        box.settle(s, abi.encodePacked(bytes32(0), bytes32(0), uint8(27)));
+        bytes32 personalDigest = keccak256(
+            abi.encodePacked("\x19Ethereum Signed Message:\n32", BoxSigning.digest(address(box), block.chainid, s))
+        );
+        (uint8 v, bytes32 r, bytes32 ss) = vm.sign(signerKey, personalDigest);
+        vm.expectRevert(Box.BadSignature.selector);
+        box.settle(s, abi.encodePacked(r, ss, v));
+        box.settle(s, _sign(s, signerKey));
+    }
+
+    function test_closedOrderIdsNeverReopenAfterEitherExit() public {
+        bytes32 key = _pay(alice, 0, 0, 17);
+        bytes32 other = _payOther(19);
+        Box.Settlement memory s = Box.Settlement(key, 0, 0, 17);
+        box.settle(s, _sign(s, signerKey));
+        uint64 paidAt = uint64(vm.getBlockTimestamp());
+        vm.warp(uint256(paidAt) + 60 days);
+        vm.prank(mallory);
+        box.reclaim(keccak256("order-2"));
+        vm.expectRevert(Box.OrderExists.selector);
+        _pay(alice, 1, 0, 1);
+        vm.expectRevert(Box.OrderExists.selector);
+        _payOther(1);
+        _assertOrder(key, alice, paidAt, true, 17);
+        _assertOrder(other, mallory, paidAt, true, 19);
+    }
+
+    /// forge-config: default.fuzz.runs = 256
+    function testFuzz_packedFieldsAndReclaimDeadline(uint64 timestamp, uint128 amount) public {
+        uint128 escrow = uint128(bound(amount, 1, type(uint128).max));
+        deal(address(usd), alice, escrow);
+        vm.warp(timestamp);
+        bytes32 key = _pay(alice, 0, 0, escrow);
+        _assertOrder(key, alice, timestamp, false, escrow);
+        // Addition must happen in uint256, even when the deadline exceeds uint64.max.
+        uint256 deadline = uint256(timestamp) + 60 days;
+        vm.warp(deadline - 1);
+        vm.expectRevert(Box.TooEarly.selector);
+        vm.prank(alice);
+        box.reclaim(ORDER);
+        _assertOrder(key, alice, timestamp, false, escrow);
+        vm.warp(deadline);
+        vm.prank(alice);
+        box.reclaim(ORDER);
+        _assertOrder(key, alice, timestamp, true, escrow);
+        assertEq(usd.balanceOf(alice), escrow);
+        assertEq(usd.balanceOf(address(box)), 0);
+    }
+
+    function test_maxPackedValuesPreservedWhenDeadlineExceedsUint64() public {
+        testFuzz_packedFieldsAndReclaimDeadline(type(uint64).max, type(uint128).max);
+    }
+
+    function test_immediatePaymentLegsKeepFullUint256Precision() public {
+        uint256 immediate = uint256(type(uint128).max) + 1;
+        deal(address(usd), alice, immediate * 2 + 1);
+        uint256 beforeFloat = usd.balanceOf(float_);
+        uint256 beforeTreasury = usd.balanceOf(treasury);
+        vm.expectEmit(true, true, true, true, address(box));
+        emit Box.Paid(box.keyOf(alice, ORDER), alice, ORDER, BODY, immediate, immediate, 1, bytes32("ref"));
+        bytes32 key = _pay(alice, immediate, immediate, 1);
+        assertEq(usd.balanceOf(float_) - beforeFloat, immediate);
+        assertEq(usd.balanceOf(treasury) - beforeTreasury, immediate);
+        assertEq(usd.balanceOf(alice), 0);
+        assertEq(usd.balanceOf(address(box)), 1);
+        _assertOrder(key, alice, uint64(block.timestamp), false, 1);
+    }
+
+    function test_validSignerCannotPartiallySettleOrWrapTheTotal() public {
+        bytes32 key = _pay(alice, 0, 0, 17);
+        _payOther(53);
+        uint256[4] memory invalidTotals = [uint256(0), 16, 18, 70];
+        bytes32[] memory keys = _oneKey(key);
+        bytes32 beforeState = _auditState(keys);
+        for (uint256 i; i < invalidTotals.length; ++i) {
+            Box.Settlement memory s = Box.Settlement(key, invalidTotals[i], 0, 0);
+            bytes memory sig = _sign(s, signerKey);
+            vm.expectRevert(Box.WrongTotal.selector);
+            box.settle(s, sig);
+            assertEq(_auditState(keys), beforeState);
+        }
+        // This would sum to 17 modulo 2**256; checked arithmetic must reject it.
+        Box.Settlement memory wrapped = Box.Settlement(key, type(uint256).max, 18, 0);
+        bytes memory wrappedSig = _sign(wrapped, signerKey);
+        vm.expectRevert(abi.encodeWithSignature("Panic(uint256)", 0x11));
+        box.settle(wrapped, wrappedSig);
+        assertEq(_auditState(keys), beforeState);
+    }
+
+    function test_lateBatchTransferFailureRollsBackEarlierOrders() public {
+        bytes32[] memory keys = new bytes32[](2);
+        keys[0] = _pay(alice, 0, 0, 17);
+        keys[1] = _payOther(19);
+        Box.Settlement[] memory batch = new Box.Settlement[](2);
+        bytes[] memory sigs = new bytes[](2);
+        batch[0] = Box.Settlement(keys[0], 1, 2, 14);
+        batch[1] = Box.Settlement(keys[1], 3, 4, 12);
+        sigs[0] = _sign(batch[0], signerKey);
+        sigs[1] = _sign(batch[1], signerKey);
+        bytes32 beforeState = _auditState(keys);
+        vm.mockCall(address(usd), abi.encodeCall(IERC20.transfer, (mallory, 12)), abi.encode(false));
+        vm.expectRevert(abi.encodeWithSelector(SafeERC20.SafeERC20FailedOperation.selector, address(usd)));
+        box.settleMany(batch, sigs);
+        assertEq(_auditState(keys), beforeState);
+        vm.clearMockedCalls();
+        box.settleMany(batch, sigs);
+        assertEq(usd.balanceOf(address(box)), 0);
+    }
 }
 
 /// The same suite against live imdUSD v1 on a mainnet fork (MAINNET_RPC_URL), paying the real Treasury.
@@ -503,5 +982,16 @@ contract BoxForkTest is BoxTest {
         vm.createSelectFork(rpc);
         treasury = 0x6Ac8fF96Fb8DCF5d79A8eF1E59D9AC23f2BD27Bc; // imdUSD Treasury
         super.setUp();
+    }
+
+    function test_launchDependenciesMatchMainnet() public view {
+        assertEq(block.chainid, 1);
+        assertGt(address(IMDUSD).code.length, 0);
+        assertGt(treasury.code.length, 0);
+        assertEq(IERC20Metadata(address(IMDUSD)).decimals(), 18);
+        assertEq(address(0xFE0bAC821272c9b905bAc995BF4AF2122b9BA741).code.length, 0);
+        assertEq(address(0xB5d3289a90868da0A8d5A4283902a0A907A29ddF).code.length, 0);
+        assertEq(address(box.IMDUSD()), address(IMDUSD));
+        assertEq(box.TREASURY(), 0x6Ac8fF96Fb8DCF5d79A8eF1E59D9AC23f2BD27Bc);
     }
 }
