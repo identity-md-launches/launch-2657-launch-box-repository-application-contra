@@ -1,0 +1,15 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "Box",
+      "constructorArgs": [
+        "0x61aaf8a992a3143e2b0c9cb0030b9fe702854a25",
+        "0x6ac8ff96fb8dcf5d79a8ef1e59d9ac23f2bd27bc",
+        "0xfe0bac821272c9b905bac995bf4af2122b9ba741",
+        "0xb5d3289a90868da0a8d5a4283902a0a907a29ddf"
+      ]
+    }
+  ],
+  "notes": "Box lets a user pay for an off-chain-quoted swarm order in imdUSD. Constructor (imdUsd, treasury, float_, signer): imdUSD v1 (plain 18-decimal ERC-20, no permit), the imdUSD Treasury, the FLOAT operator wallet that pays the swarm, and the SIGNER EOA that signs settlements. All four are static addresses from the brief; the constructor only rejects zero addresses and makes no external call. pay() sends the first request's cost to FLOAT and a buffer to TREASURY and holds the rest as escrow, keyed by keccak256(payer, orderId). Escrow leaves only through settle/settleMany (an EIP-712 Settlement signed by SIGNER that splits exactly that order's escrow among TREASURY, FLOAT and the payer; anyone may execute) or the payer's reclaim() from 60 days after payment. settleMany skips orders that are already closed. Box has no owner, admin, pause, setter or upgrade path, so $owner is not used."
+}
